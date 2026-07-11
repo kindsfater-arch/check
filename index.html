@@ -126,9 +126,10 @@
 </div>
 
 <script>
-// ─── Конфигурация (ключи те же, что в исходном сервисе) ──────────────────────
-const GEMINI_API_KEY = 'AIzaSyCGBtzhyTm_1fuo6bGu34jz9MiiSQm1MR0';
-const GEMINI_API_URL  = 'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent';
+// ─── Конфигурация ────────────────────────────────────────────────────────────
+// Gemini-ключ здесь БОЛЬШЕ НЕ НУЖЕН: распознавание выполняет Apps Script на
+// серверах Google (ключ живёт в Config.gs на сервере, из браузера не виден).
+// Браузер общается только со script.google.com — VPN не требуется.
 
 // URL Web App существующего проекта бота (Deploy → Web app → …/exec).
 // ВСТАВЬ СЮДА после деплоя существующего Apps Script проекта.
@@ -145,26 +146,6 @@ const FIELDS = [
   { key:'bank',         label:'Банк' },
   { key:'comment',      label:'Комментарий' },
 ];
-
-// Тот же промпт, что в GeminiService.gs
-const PROMPT = [
-  'Ты — эксперт по распознаванию российских кассовых чеков (ФНС, ОФД, ФФД).',
-  'Внимательно изучи изображение чека и извлеки данные.',
-  'Даже если изображение нечёткое или сжатое — постарайся извлечь хотя бы часть данных.',
-  '',
-  'Верни СТРОГО JSON-объект с полями (без пояснений, только JSON):',
-  '{',
-  '  "inn": "ИНН — 10 или 12 цифр из шапки чека, или null",',
-  '  "store_name": "торговое название (Магнит, Пятёрочка и т.п.), или null",',
-  '  "legal_name": "юр. название начинающееся с ООО/АО/ИП/ПАО, или null",',
-  '  "receipt_date": "дата из строки Дата: в формате ДД.ММ.ГГГГ ЧЧ:ММ, или null",',
-  '  "address": "адрес магазина одной строкой, или null",',
-  '  "bank": "название банка из раздела оплаты (Сбербанк, Тинькофф, ВТБ, Альфа-Банк и т.п.), или null",',
-  '  "comment": "итоговая сумма и способ оплаты до 100 символов, или null"',
-  '}',
-  '',
-  'Правила: все значения однострочные без \\n. Если поле отсутствует — null (не пустая строка).'
-].join('\n');
 
 // ─── DOM ─────────────────────────────────────────────────────────────────────
 const $ = id => document.getElementById(id);
@@ -199,50 +180,62 @@ function loadFile(file){
   if (!file.type || file.type.indexOf('image/') !== 0){
     showStatus('err', '❌ Это не изображение. Загрузите фото чека.'); return;
   }
-  currentMime = file.type;
   const reader = new FileReader();
   reader.onload = () => {
-    const dataUrl = reader.result;
-    currentBase64 = dataUrl.split(',')[1];
-    previewImg.src = dataUrl;
-    preview.style.display = 'block';
-    recognizeRow.style.display = 'flex';
-    hideStatus();
-    fieldsCard.style.display = 'none';
+    const img = new Image();
+    img.onload = () => {
+      // Уменьшаем до 1600px по большей стороне — меньше payload, быстрее ответ
+      const MAX = 1600;
+      let w = img.width, h = img.height;
+      if (w > MAX || h > MAX){
+        const s = Math.min(MAX / w, MAX / h);
+        w = Math.round(w * s); h = Math.round(h * s);
+      }
+      const canvas = document.createElement('canvas');
+      canvas.width = w; canvas.height = h;
+      canvas.getContext('2d').drawImage(img, 0, 0, w, h);
+      const dataUrl = canvas.toDataURL('image/jpeg', 0.85);
+      currentMime = 'image/jpeg';
+      currentBase64 = dataUrl.split(',')[1];
+      previewImg.src = dataUrl;
+      preview.style.display = 'block';
+      recognizeRow.style.display = 'flex';
+      hideStatus();
+      fieldsCard.style.display = 'none';
+    };
+    img.onerror = () => showStatus('err', '❌ Не удалось прочитать изображение.');
+    img.src = reader.result;
   };
   reader.readAsDataURL(file);
 }
 
-// ─── Распознавание через Gemini ──────────────────────────────────────────────
+// ─── Распознавание: фото → Apps Script → Gemini (сервер) → поля ──────────────
 recognizeBtn.onclick = analyze;
 
 async function analyze(){
   if (!currentBase64){ showStatus('err','Сначала загрузите фото.'); return; }
+  if (SAVE_ENDPOINT_URL.indexOf('PASTE_') === 0){
+    showStatus('err','⚠️ Не задан URL Apps Script в SAVE_ENDPOINT_URL.'); return;
+  }
   recognizeBtn.disabled = true;
   showStatus('load', 'Распознаю чек, подождите…');
   fieldsCard.style.display = 'none';
 
-  const payload = {
-    contents: [{ parts: [
-      { text: PROMPT },
-      { inline_data: { mime_type: currentMime, data: currentBase64 } }
-    ]}],
-    generationConfig: { temperature: 0.2, maxOutputTokens: 2048, responseMimeType: 'application/json' }
-  };
-
+  // Content-Type: text/plain — «простой» запрос без CORS-preflight (GAS не
+  // отвечает на OPTIONS). Ответ Apps Script при этом читается штатно.
   try {
-    const resp = await fetch(GEMINI_API_URL + '?key=' + GEMINI_API_KEY, {
-      method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload)
+    const resp = await fetch(SAVE_ENDPOINT_URL, {
+      method:'POST',
+      headers:{'Content-Type':'text/plain;charset=utf-8'},
+      body: JSON.stringify({ action:'recognize_receipt', imageBase64: currentBase64 })
     });
-    const body = await resp.text();
-    if (!resp.ok) throw new Error('Gemini API ' + resp.status + ': ' + body);
+    const txt = await resp.text();
+    let json;
+    try { json = JSON.parse(txt); }
+    catch(e){ throw new Error('Некорректный ответ сервера: ' + txt.slice(0, 200)); }
+    if (!json.ok) throw new Error(json.error || 'Не удалось распознать');
 
-    const parsed = JSON.parse(body);
-    const cand = parsed.candidates && parsed.candidates[0];
-    if (!cand) throw new Error('Пустой ответ Gemini');
-    const text = cand.content.parts[0].text;
-
-    const data = parseGeminiJson(text);
+    const data = json.data || {};
     normalize(data);
     renderFields(data);
     hideStatus();
@@ -253,22 +246,14 @@ async function analyze(){
   }
 }
 
-function parseGeminiJson(text){
-  const clean = text.replace(/```json\s*/gi,'').replace(/```\s*/g,'').trim();
-  try { return JSON.parse(clean); }
-  catch(e){
-    const s = clean.indexOf('{'), en = clean.lastIndexOf('}');
-    if (s !== -1 && en > s){ try { return JSON.parse(clean.substring(s, en+1)); } catch(e2){} }
-    return {};
-  }
-}
-
 function normalize(data){
-  // Дата добавления — всегда текущая (Gemini её не знает)
-  const now = new Date();
-  const dd = String(now.getDate()).padStart(2,'0');
-  const mm = String(now.getMonth()+1).padStart(2,'0');
-  data.added_date = dd + '.' + mm + '.' + now.getFullYear();
+  // Дата добавления: сервер её уже проставляет; страхуемся, если пусто
+  if (!data.added_date){
+    const now = new Date();
+    const dd = String(now.getDate()).padStart(2,'0');
+    const mm = String(now.getMonth()+1).padStart(2,'0');
+    data.added_date = dd + '.' + mm + '.' + now.getFullYear();
+  }
   FIELDS.forEach(f => {
     let v = data[f.key];
     if (v === undefined || v === null) { data[f.key] = ''; return; }
@@ -316,16 +301,17 @@ async function save(){
 
   const bodyStr = JSON.stringify({ action:'save_receipt', userId:'web', userName:'web', data:data });
 
-  // Единственный no-cors POST: Apps Script не отдаёт CORS-заголовки, поэтому
-  // ответ прочитать нельзя, но appendRow выполняется. Один запрос = одна строка
-  // (обычный fetch отклонился бы по CORS и провоцировал бы дубль-запись).
+  // Тот же «простой» POST (text/plain, без preflight) — ответ Apps Script читаем.
   try {
-    await fetch(SAVE_ENDPOINT_URL, {
-      method:'POST', mode:'no-cors',
-      headers:{'Content-Type':'text/plain;charset=utf-8'}, // simple request, без preflight
+    const resp = await fetch(SAVE_ENDPOINT_URL, {
+      method:'POST',
+      headers:{'Content-Type':'text/plain;charset=utf-8'},
       body: bodyStr
     });
-    done();
+    const txt = await resp.text();
+    let ok = false;
+    try { ok = JSON.parse(txt).ok; } catch(e){}
+    if (ok) done(); else throw new Error(txt.slice(0, 200) || ('HTTP ' + resp.status));
   } catch (err){
     showStatus('err','❌ Ошибка сохранения: ' + err.message);
     saveBtn.disabled = false;
