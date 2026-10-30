@@ -76,6 +76,24 @@
   .foot{color:var(--muted);font-size:11.5px;text-align:center;margin-top:18px}
   .save-row{display:flex;gap:10px;margin-top:6px}
   .save-row button{flex:1}
+
+  [hidden]{display:none!important}
+  button:focus-visible{outline:2px solid var(--accent);outline-offset:3px}
+  .mcc-intro,.mcc-note{color:var(--muted);font-size:12.5px}
+  .mcc-intro{margin:8px 0 0}
+  #mccPanel{margin-top:16px}
+  #mccStatus{margin:12px 0 0}
+  .mcc-result{margin-top:16px;padding:16px;background:var(--card2);
+    border:1px solid var(--line);border-left:3px solid var(--accent);border-radius:10px;
+    overflow-wrap:anywhere}
+  .mcc-result h2{font-size:12.5px;font-weight:600;color:var(--muted);margin:0 0 8px}
+  .mcc-code{font-size:34px;font-weight:700;letter-spacing:2px;font-variant-numeric:tabular-nums;line-height:1.2}
+  .mcc-description{font-weight:600;margin:8px 0}
+  .mcc-reason,.mcc-clarification{margin:8px 0 0;font-size:14px}
+  .mcc-note{margin:14px 0 0}
+  @media (prefers-reduced-motion: reduce){
+    *,*::before,*::after{animation:none!important;scroll-behavior:auto!important;transition:none!important}
+  }
 </style>
 </head>
 <body>
@@ -106,6 +124,36 @@
     <input type="file" id="fileInput" accept="image/*">
     <input type="file" id="camInput" accept="image/*" capture="environment">
   </div>
+
+  <!-- Подбор MCC доступен независимо от загрузки чека -->
+  <section class="card" aria-label="Подбор MCC">
+    <button class="ghost wide" id="mccToggleBtn" type="button" aria-expanded="false" aria-controls="mccPanel">🧭 Подобрать MCC по описанию</button>
+    <p class="mcc-intro">Опишите деятельность торговой точки — Gemini предложит код и его расшифровку.</p>
+    <div id="mccPanel" hidden>
+      <form id="mccForm">
+        <div class="field">
+          <label for="mccDescription">Что продаёт торговая точка?</label>
+          <textarea id="mccDescription" rows="4" maxlength="3000" required aria-describedby="mccHelp" placeholder="Например: небольшая пекарня, печём и продаём хлеб и выпечку навынос. Основная выручка — от собственной выпечки."></textarea>
+          <div class="mcc-intro" id="mccHelp">Укажите основные товары или услуги, формат продаж и что приносит большую часть выручки. До 3000 символов.</div>
+        </div>
+        <button class="wide" id="mccSubmitBtn" type="submit">Предложить MCC</button>
+      </form>
+      <div class="status" id="mccStatus" role="status" aria-live="polite">
+        <div class="spinner" id="mccStatusSpin" aria-hidden="true"></div>
+        <div id="mccStatusText"></div>
+      </div>
+      <div class="mcc-result" id="mccResult" role="region" aria-labelledby="mccResultTitle" tabindex="-1" hidden>
+        <h2 id="mccResultTitle">Рекомендуемый MCC</h2>
+        <div id="mccSuggestion">
+          <div class="mcc-code" id="mccCode"></div>
+          <p class="mcc-description" id="mccCategory"></p>
+          <p class="mcc-reason" id="mccReason"></p>
+        </div>
+        <p class="mcc-clarification" id="mccClarification" hidden></p>
+        <p class="mcc-note">Рекомендация по описанию деятельности. Окончательный MCC согласуется с банком-эквайером.</p>
+      </div>
+    </div>
+  </section>
 
   <!-- Статус -->
   <div class="status" id="status">
@@ -158,6 +206,84 @@ const saveBtn = $('saveBtn'), resetBtn = $('resetBtn');
 
 let currentBase64 = null;   // base64 без префикса
 let currentMime = 'image/jpeg';
+
+// ─── Подбор MCC по текстовому описанию ───────────────────────────────────────
+const mccForm = $('mccForm'), mccDescription = $('mccDescription');
+const mccSubmitBtn = $('mccSubmitBtn'), mccResult = $('mccResult');
+$('mccToggleBtn').onclick = () => {
+  const panel = $('mccPanel');
+  panel.hidden = !panel.hidden;
+  $('mccToggleBtn').setAttribute('aria-expanded', String(!panel.hidden));
+  if (!panel.hidden) mccDescription.focus();
+};
+mccDescription.addEventListener('input', () => {
+  mccDescription.setCustomValidity('');
+  mccResult.hidden = true;
+  $('mccStatus').className = 'status';
+});
+mccForm.onsubmit = suggestMcc;
+
+function showMccStatus(kind, text){
+  $('mccStatus').className = 'status show' + (kind === 'err' ? ' err' : '');
+  $('mccStatusSpin').style.display = kind === 'load' ? 'block' : 'none';
+  $('mccStatusText').textContent = text;
+}
+
+async function suggestMcc(event){
+  event.preventDefault();
+  if (mccSubmitBtn.disabled) return;
+  const description = mccDescription.value.trim();
+  if (!description || description.length > 3000){
+    mccDescription.setCustomValidity(description ? 'Не более 3000 символов.' : 'Опишите деятельность торговой точки.');
+    mccDescription.reportValidity();
+    return;
+  }
+  mccSubmitBtn.disabled = true;
+  mccDescription.disabled = true;
+  mccForm.setAttribute('aria-busy', 'true');
+  mccResult.hidden = true;
+  showMccStatus('load', 'Подбираю MCC по описанию…');
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 90000);
+  try {
+    const response = await fetch(SAVE_ENDPOINT_URL, {
+      method:'POST',
+      headers:{'Content-Type':'text/plain;charset=utf-8'},
+      body:JSON.stringify({ action:'suggest_mcc', description:description }),
+      signal:controller.signal
+    });
+    if (!response.ok) throw new Error('Сервис недоступен (HTTP ' + response.status + '). Попробуйте позже.');
+    let json;
+    try { json = await response.json(); }
+    catch (err){ throw new Error('Сервис подбора MCC пока недоступен. Попробуйте позже.'); }
+    if (!json || !json.ok) throw new Error(json && json.error || 'Не удалось подобрать MCC.');
+    const data = json.data;
+    if (!data || ['mcc','description','reason','clarification'].some(key => typeof data[key] !== 'string') ||
+        (data.mcc ? !/^(?!0000)\d{4}$/.test(data.mcc) || !data.description || !data.reason || data.clarification
+                  : !data.clarification || data.description || data.reason)){
+      throw new Error('Получен некорректный ответ. Попробуйте ещё раз.');
+    }
+    $('mccCode').textContent = data.mcc;
+    $('mccCategory').textContent = data.description;
+    $('mccReason').textContent = data.reason;
+    $('mccClarification').textContent = data.clarification;
+    $('mccSuggestion').hidden = !data.mcc;
+    $('mccClarification').hidden = Boolean(data.mcc);
+    $('mccResultTitle').textContent = data.mcc ? 'Рекомендуемый MCC' : 'Нужно уточнить описание';
+    $('mccStatus').className = 'status';
+    mccResult.hidden = false;
+    mccResult.focus();
+  } catch (err){
+    showMccStatus('err', err.name === 'AbortError'
+      ? 'Сервис отвечает слишком долго. Попробуйте ещё раз.'
+      : 'Ошибка подбора MCC: ' + err.message);
+  } finally {
+    clearTimeout(timeout);
+    mccSubmitBtn.disabled = false;
+    mccDescription.disabled = false;
+    mccForm.setAttribute('aria-busy', 'false');
+  }
+}
 
 // ─── Выбор файла ─────────────────────────────────────────────────────────────
 $('pickBtn').onclick = () => fileInput.click();
