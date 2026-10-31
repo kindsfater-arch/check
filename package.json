@@ -1,10 +1,11 @@
 {
   "name": "checkscan",
   "private": true,
-  "version": "1.1.0",
+  "version": "1.2.0",
   "scripts": {
     "test": "node --test tests/*.test.cjs",
-    "test:live": "node scripts/smoke-mcc.cjs"
+    "test:live": "node scripts/smoke-mcc.cjs",
+    "mcc:sync": "node scripts/update-mcc-catalog.cjs"
   },
   "devDependencies": {
     "jsdom": "30.1.3"
